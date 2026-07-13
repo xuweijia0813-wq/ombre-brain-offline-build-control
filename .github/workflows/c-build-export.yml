@@ -110,8 +110,18 @@ jobs:
           test "$(uname -m)" = 'x86_64'
           test "$(docker info --format '{{.OSType}}')" = 'linux'
           test "$(docker info --format '{{.Architecture}}')" = 'x86_64'
-          docker buildx inspect default | grep -Eq '^Driver:[[:space:]]+docker$'
-          docker buildx inspect default | grep -Eq 'Platforms:.*linux/amd64'
+          builder_inspect="$(docker buildx inspect default)"
+          printf '%s\n' "$builder_inspect"
+
+          driver="$(
+            awk -F ': *' '/^Driver:/ {print $2; exit}' \
+              <<<"$builder_inspect"
+          )"
+          test "$driver" = "docker"
+
+          grep -E '^Platforms:.*linux/amd64([, ]|$)' \
+            <<<"$builder_inspect" \
+            >/dev/null
 
           available_bytes=$(df -PB1 / | awk 'NR == 2 {print $4}')
           memory_bytes=$(awk '/^MemTotal:/ {print $2 * 1024}' /proc/meminfo)
