@@ -12,8 +12,13 @@ concurrency:
 
 env:
   SOURCE_REPOSITORY: Yinglianchun/Ombre-Brain
+  SOURCE_PARENT: e0bcbdfa07832c892be5be01f4f572f25783f943
   SOURCE_COMMIT: efb9dd1f16d2c4b01b4d216f01b9cb281d6c0a3f
   SOURCE_TREE: af1ccefc5598969b849d45c9de673ba0a0fcc80d
+  SOURCE_BUNDLE_PATH: control/source-bundles/ombre-brain/efb9dd1f16d2c4b01b4d216f01b9cb281d6c0a3f.bundle
+  SOURCE_BUNDLE_REF: refs/heads/bundle/minimal-state-paths-20260714
+  SOURCE_BUNDLE_SHA256: 8f7c8f05d1046ad708dce014487bf010f2ff380a7236ea38696fcc7757e1d98c
+  SOURCE_BUNDLE_BYTES: "1891"
   IMAGE_TAG_BRAIN: ombre-brain-ombre-brain
   IMAGE_TAG_GATEWAY: ombre-brain-ombre-gateway
   MIN_FREE_BYTES: "10737418240"
@@ -36,11 +41,11 @@ jobs:
           fetch-depth: 1
           path: control
 
-      - name: Checkout fixed source commit
+      - name: Checkout fixed source parent
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ env.SOURCE_COMMIT }}
+          ref: ${{ env.SOURCE_PARENT }}
           persist-credentials: false
           fetch-depth: 1
           path: source
@@ -51,14 +56,74 @@ jobs:
           set -euo pipefail
           mkdir -p evidence payload build-context
 
+          bundle="$GITHUB_WORKSPACE/$SOURCE_BUNDLE_PATH"
+          test -f "$bundle"
+
+          actual_bundle_bytes="$(stat --format='%s' "$bundle")"
+          printf 'bundle_bytes=%s\nexpected_bundle_bytes=%s\n' \
+            "$actual_bundle_bytes" "$SOURCE_BUNDLE_BYTES" \
+            | tee evidence/source-bundle-size.txt
+          test "$actual_bundle_bytes" = "$SOURCE_BUNDLE_BYTES"
+
+          sha256sum "$bundle" \
+            | tee evidence/source-bundle.sha256
+          test "$(awk '{print $1}' evidence/source-bundle.sha256)" \
+            = "$SOURCE_BUNDLE_SHA256"
+
+          LC_ALL=C sed -n '1,/^$/p' "$bundle" \
+            | tee evidence/source-bundle-header.txt
+          bundle_prerequisite="$(
+            awk '/^-/ {print substr($1, 2)}' \
+              evidence/source-bundle-header.txt
+          )"
+          test "$bundle_prerequisite" = "$SOURCE_PARENT"
+
+          git -C source bundle verify "$bundle" 2>&1 \
+            | tee evidence/source-bundle-verify.txt
+          git bundle list-heads "$bundle" \
+            | tee evidence/source-bundle-heads.txt
+
+          bundle_commit="$(
+            awk -v ref="$SOURCE_BUNDLE_REF" \
+              '$2 == ref {print $1}' \
+              evidence/source-bundle-heads.txt
+          )"
+          test "$bundle_commit" = "$SOURCE_COMMIT"
+
+          git -C source fetch --no-tags \
+            "$bundle" "$SOURCE_BUNDLE_REF"
+          test "$(git -C source rev-parse FETCH_HEAD)" \
+            = "$SOURCE_COMMIT"
+          git -C source checkout --detach FETCH_HEAD
+
           git -C control rev-parse HEAD | tee evidence/control-git-head.txt
           git -C source rev-parse HEAD | tee evidence/source-git-head.txt
+          git -C source rev-parse 'HEAD^' | tee evidence/source-git-parent.txt
           git -C source rev-parse 'HEAD^{tree}' | tee evidence/source-git-tree.txt
           git -C source status --porcelain | tee evidence/source-worktree-status.txt
 
           test "$(cat evidence/source-git-head.txt)" = "$SOURCE_COMMIT"
+          test "$(cat evidence/source-git-parent.txt)" = "$SOURCE_PARENT"
           test "$(cat evidence/source-git-tree.txt)" = "$SOURCE_TREE"
           test ! -s evidence/source-worktree-status.txt
+
+          git -C source diff --name-only \
+            "$SOURCE_PARENT" "$SOURCE_COMMIT" \
+            | LC_ALL=C sort \
+            | tee evidence/source-approved-diff-files.txt
+          diff -u \
+            <(printf '%s\n' \
+              config.example.yaml \
+              decay_engine.py \
+              embedding_engine.py \
+              gateway.py \
+              gateway_state.py \
+              server.py \
+              utils.py \
+              | LC_ALL=C sort) \
+            evidence/source-approved-diff-files.txt
+          sha256sum evidence/source-approved-diff-files.txt \
+            | tee evidence/source-approved-diff-files.sha256
 
           sha256sum control/.github/workflows/c-build-export.yml \
             | tee evidence/control-workflow.sha256
