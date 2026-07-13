@@ -71,13 +71,13 @@ jobs:
             'source/requirements.txt' | sha256sum --check
           printf '%s  %s\n' \
             'a83584a0bf0853cb85cd5e33ac004b388a891d3b53478d47ac9f5dd8868adc8d' \
-            'source/docker-compose.hk.yml' | sha256sum --check
+            'source/compose.hk.yml' | sha256sum --check
           printf '%s  %s\n' \
             'c1777baa98fe84b301e27e7a1c625c806461bb536013d0d8037e7c498d846bff' \
             'source/docker-compose.yml' | sha256sum --check
 
           sha256sum source/Dockerfile source/requirements.txt \
-            source/docker-compose.hk.yml source/docker-compose.yml \
+            source/compose.hk.yml source/docker-compose.yml \
             | tee evidence/audited-source-files.sha256
 
           if git -C source grep -I -n -E \
