@@ -1,0 +1,156 @@
+name: C-PRECHECK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: c-precheck
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: Yinglianchun/Ombre-Brain
+  SOURCE_COMMIT: e0bcbdfa07832c892be5be01f4f572f25783f943
+  SOURCE_TREE: 85dfd7b5bac3fe32d69deecc4af1f3370b682822
+  MIN_FREE_BYTES: "10737418240"
+  MIN_MEMORY_BYTES: "12884901888"
+
+jobs:
+  precheck:
+    name: Read-only runner precheck
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout control repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          path: control
+
+      - name: Checkout fixed source commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_COMMIT }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: source
+
+      - name: Verify fixed source identity and audited files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git -C source rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          test -z "$(git -C source status --porcelain)"
+
+          printf '%s  %s\n' \
+            '82235110d228e6ba4e24952e95d0de3274f54f375e31ce9e0f327f1b8b8b60d7' \
+            'source/Dockerfile' | sha256sum --check
+          printf '%s  %s\n' \
+            'c12ec81ff00a09ad3b38f56fed77903a21cc4ec4d91d2806061ed239c3da37af' \
+            'source/requirements.txt' | sha256sum --check
+          printf '%s  %s\n' \
+            'a83584a0bf0853cb85cd5e33ac004b388a891d3b53478d47ac9f5dd8868adc8d' \
+            'source/docker-compose.hk.yml' | sha256sum --check
+          printf '%s  %s\n' \
+            'c1777baa98fe84b301e27e7a1c625c806461bb536013d0d8037e7c498d846bff' \
+            'source/docker-compose.yml' | sha256sum --check
+
+          if git -C source grep -I -n -E \
+            'version https://git-lfs.github.com/spec/v1|BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{20,}' \
+            HEAD -- .; then
+            echo 'Unexpected LFS pointer or high-confidence credential pattern in fixed source tree.' >&2
+            exit 1
+          fi
+
+      - name: Verify runner baseline and fixed default builder
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo 'UTC time:'
+          date --utc --iso-8601=seconds
+          timedatectl status || true
+
+          test "$(uname -m)" = 'x86_64'
+          test "$(docker info --format '{{.OSType}}')" = 'linux'
+          test "$(docker info --format '{{.Architecture}}')" = 'x86_64'
+
+          available_bytes=$(df -PB1 / | awk 'NR == 2 {print $4}')
+          memory_bytes=$(awk '/^MemTotal:/ {print $2 * 1024}' /proc/meminfo)
+          printf 'available_bytes=%s\nmemory_bytes=%.0f\n' "$available_bytes" "$memory_bytes"
+          test "$available_bytes" -ge "$MIN_FREE_BYTES"
+          awk -v actual="$memory_bytes" -v minimum="$MIN_MEMORY_BYTES" \
+            'BEGIN {exit !(actual >= minimum)}'
+
+          docker version
+          docker compose version
+          docker buildx version
+          containerd --version
+          docker info
+          docker buildx ls
+          docker buildx inspect default
+          docker buildx inspect default | grep -Eq '^Driver:[[:space:]]+docker$'
+          docker buildx inspect default | grep -Eq 'Platforms:.*linux/amd64'
+
+          image_count=$(docker image ls -aq | sort -u | wc -l)
+          printf 'preexisting_image_count=%s\n' "$image_count"
+          test "$image_count" -eq 0
+          docker buildx du || true
+
+      - name: Verify GitHub and Docker Hub path three times
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          probe_exact() {
+            local label=$1
+            local expected=$2
+            local url=$3
+            local result
+            result=$(curl --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              --output /dev/null \
+              --write-out 'http=%{http_code} remote=%{remote_ip} tls_verify=%{ssl_verify_result}' \
+              "$url")
+            local status=$?
+            printf '%s %s curl_exit=%s\n' "$label" "$result" "$status"
+            test "$status" -eq 0
+            test "${result#http=}" != "$result"
+            test "${result%% *}" = "http=${expected}"
+          }
+
+          probe_nonzero() {
+            local label=$1
+            local url=$2
+            local result
+            result=$(curl --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              --output /dev/null \
+              --write-out 'http=%{http_code} remote=%{remote_ip} tls_verify=%{ssl_verify_result}' \
+              "$url")
+            local status=$?
+            printf '%s %s curl_exit=%s\n' "$label" "$result" "$status"
+            test "$status" -eq 0
+            test "${result%% *}" != 'http=000'
+          }
+
+          for repetition in 1 2 3; do
+            echo "ROUND=${repetition}"
+            probe_exact github 200 https://github.com/
+            probe_exact registry 401 https://registry-1.docker.io/v2/
+            probe_exact auth 200 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/python:pull'
+            probe_nonzero cdn https://production.cloudflare.docker.com/
+          done
+
+      - name: Confirm precheck completion
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'C-PRECHECK passed. No image was pulled or built, and no builder was created.'
