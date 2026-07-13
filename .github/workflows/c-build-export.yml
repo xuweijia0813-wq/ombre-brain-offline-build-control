@@ -1,0 +1,294 @@
+name: C-BUILD-EXPORT
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: c-build-export
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: Yinglianchun/Ombre-Brain
+  SOURCE_COMMIT: e0bcbdfa07832c892be5be01f4f572f25783f943
+  SOURCE_TREE: 85dfd7b5bac3fe32d69deecc4af1f3370b682822
+  IMAGE_TAG_BRAIN: ombre-brain-ombre-brain
+  IMAGE_TAG_GATEWAY: ombre-brain-ombre-gateway
+  MIN_FREE_BYTES: "10737418240"
+  MIN_MEMORY_BYTES: "12884901888"
+  MAX_PAYLOAD_BYTES: "399336704"
+  MAX_EVIDENCE_BYTES: "67108864"
+  POST_BUILD_SAFETY_BYTES: "4294967296"
+
+jobs:
+  build-export:
+    name: Build and export audited Docker archive
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout control repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          path: control
+
+      - name: Checkout fixed source commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_COMMIT }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: source
+
+      - name: Create evidence directory and verify identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence payload build-context
+
+          git -C control rev-parse HEAD | tee evidence/control-git-head.txt
+          git -C source rev-parse HEAD | tee evidence/source-git-head.txt
+          git -C source rev-parse 'HEAD^{tree}' | tee evidence/source-git-tree.txt
+          git -C source status --porcelain | tee evidence/source-worktree-status.txt
+
+          test "$(cat evidence/source-git-head.txt)" = "$SOURCE_COMMIT"
+          test "$(cat evidence/source-git-tree.txt)" = "$SOURCE_TREE"
+          test ! -s evidence/source-worktree-status.txt
+
+          sha256sum control/.github/workflows/c-build-export.yml \
+            | tee evidence/control-workflow.sha256
+
+          printf '%s  %s\n' \
+            '82235110d228e6ba4e24952e95d0de3274f54f375e31ce9e0f327f1b8b8b60d7' \
+            'source/Dockerfile' | sha256sum --check
+          printf '%s  %s\n' \
+            'c12ec81ff00a09ad3b38f56fed77903a21cc4ec4d91d2806061ed239c3da37af' \
+            'source/requirements.txt' | sha256sum --check
+          printf '%s  %s\n' \
+            'a83584a0bf0853cb85cd5e33ac004b388a891d3b53478d47ac9f5dd8868adc8d' \
+            'source/docker-compose.hk.yml' | sha256sum --check
+          printf '%s  %s\n' \
+            'c1777baa98fe84b301e27e7a1c625c806461bb536013d0d8037e7c498d846bff' \
+            'source/docker-compose.yml' | sha256sum --check
+
+          sha256sum source/Dockerfile source/requirements.txt \
+            source/docker-compose.hk.yml source/docker-compose.yml \
+            | tee evidence/audited-source-files.sha256
+
+          if git -C source grep -I -n -E \
+            'version https://git-lfs.github.com/spec/v1|BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{20,}' \
+            HEAD -- .; then
+            echo 'Unexpected LFS pointer or high-confidence credential pattern in fixed source tree.' >&2
+            exit 1
+          fi
+
+      - name: Repeat runner, toolchain, builder, disk and time precheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo 'UTC time:'
+            date --utc --iso-8601=seconds
+            timedatectl status || true
+            uname -a
+            docker version
+            docker compose version
+            docker buildx version
+            containerd --version
+            docker info
+            docker buildx ls
+            docker buildx inspect default
+            df -h /
+            free -h
+          } | tee evidence/runner-toolchain.txt
+
+          test "$(uname -m)" = 'x86_64'
+          test "$(docker info --format '{{.OSType}}')" = 'linux'
+          test "$(docker info --format '{{.Architecture}}')" = 'x86_64'
+          docker buildx inspect default | grep -Eq '^Driver:[[:space:]]+docker$'
+          docker buildx inspect default | grep -Eq 'Platforms:.*linux/amd64'
+
+          available_bytes=$(df -PB1 / | awk 'NR == 2 {print $4}')
+          memory_bytes=$(awk '/^MemTotal:/ {print $2 * 1024}' /proc/meminfo)
+          printf 'available_bytes=%s\nmemory_bytes=%.0f\n' "$available_bytes" "$memory_bytes" \
+            | tee evidence/initial-capacity.txt
+          test "$available_bytes" -ge "$MIN_FREE_BYTES"
+          awk -v actual="$memory_bytes" -v minimum="$MIN_MEMORY_BYTES" \
+            'BEGIN {exit !(actual >= minimum)}'
+
+          image_count=$(docker image ls -aq | sort -u | wc -l)
+          printf 'preexisting_image_count=%s\n' "$image_count" \
+            | tee evidence/preexisting-docker-state.txt
+          test "$image_count" -eq 0
+          docker buildx du 2>&1 | tee -a evidence/preexisting-docker-state.txt || true
+
+      - name: Repeat GitHub and Docker Hub path verification three times
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          probe_exact() {
+            local label=$1
+            local expected=$2
+            local url=$3
+            local result
+            result=$(curl --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              --output /dev/null \
+              --write-out 'http=%{http_code} remote=%{remote_ip} tls_verify=%{ssl_verify_result}' \
+              "$url")
+            local status=$?
+            printf '%s %s curl_exit=%s\n' "$label" "$result" "$status"
+            test "$status" -eq 0
+            test "${result%% *}" = "http=${expected}"
+          }
+
+          probe_nonzero() {
+            local label=$1
+            local url=$2
+            local result
+            result=$(curl --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              --output /dev/null \
+              --write-out 'http=%{http_code} remote=%{remote_ip} tls_verify=%{ssl_verify_result}' \
+              "$url")
+            local status=$?
+            printf '%s %s curl_exit=%s\n' "$label" "$result" "$status"
+            test "$status" -eq 0
+            test "${result%% *}" != 'http=000'
+          }
+
+          {
+            for repetition in 1 2 3; do
+              echo "ROUND=${repetition}"
+              probe_exact github 200 https://github.com/
+              probe_exact registry 401 https://registry-1.docker.io/v2/
+              probe_exact auth 200 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/python:pull'
+              probe_nonzero cdn https://production.cloudflare.docker.com/
+            done
+          } | tee evidence/network-precheck.txt
+
+      - name: Create deterministic build context and record base image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git -C source archive --format=tar "$SOURCE_COMMIT" \
+            | tar -xf - -C build-context
+
+          find build-context -type f -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | tee evidence/build-context-files.sha256
+          find build-context -printf '%P\t%y\t%s\t%m\n' \
+            | LC_ALL=C sort \
+            | tee evidence/build-context-metadata.tsv
+          sha256sum evidence/build-context-files.sha256 \
+            evidence/build-context-metadata.tsv \
+            | tee evidence/build-context-manifest.sha256
+
+          test ! -e build-context/.git
+
+          base_image=$(awk 'toupper($1) == "FROM" {print $2; exit}' build-context/Dockerfile)
+          test -n "$base_image"
+          printf 'base_image=%s\n' "$base_image" | tee evidence/base-image.txt
+          docker buildx imagetools inspect "$base_image" \
+            | tee evidence/base-image-inspect.txt
+
+      - name: Build one linux/amd64 image with the fixed default builder
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker buildx build \
+            --builder default \
+            --platform linux/amd64 \
+            --pull \
+            --no-cache \
+            --load \
+            --progress plain \
+            --metadata-file evidence/build-metadata.json \
+            --tag "$IMAGE_TAG_BRAIN" \
+            --file build-context/Dockerfile \
+            build-context 2>&1 | tee evidence/build.log
+
+      - name: Apply second tag and verify one-image model
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          brain_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG_BRAIN")
+          docker image tag "$IMAGE_TAG_BRAIN" "$IMAGE_TAG_GATEWAY"
+          gateway_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG_GATEWAY")
+
+          test "$brain_id" = "$gateway_id"
+          printf 'IMAGE_TAG_BRAIN=%s\nIMAGE_TAG_GATEWAY=%s\nIMAGE_ID=%s\n' \
+            "$IMAGE_TAG_BRAIN" "$IMAGE_TAG_GATEWAY" "$brain_id" \
+            | tee evidence/image-identity.txt
+
+          docker image inspect "$IMAGE_TAG_BRAIN" \
+            | tee evidence/image-inspect-brain.json
+          docker image inspect "$IMAGE_TAG_GATEWAY" \
+            | tee evidence/image-inspect-gateway.json
+          docker image history --no-trunc "$IMAGE_TAG_BRAIN" \
+            | tee evidence/image-history.txt
+          docker image ls --digests --no-trunc \
+            | tee evidence/docker-image-list.txt
+
+          image_size=$(docker image inspect --format '{{.Size}}' "$IMAGE_TAG_BRAIN")
+          available_bytes=$(df -PB1 / | awk 'NR == 2 {print $4}')
+          required_bytes=$((image_size * 3 + POST_BUILD_SAFETY_BYTES))
+          printf 'image_size=%s\navailable_bytes=%s\nrequired_bytes=%s\n' \
+            "$image_size" "$available_bytes" "$required_bytes" \
+            | tee evidence/post-build-capacity.txt
+          test "$available_bytes" -ge "$required_bytes"
+
+      - name: Export Docker archive and enforce storage limits
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker save \
+            --output payload/ombre-brain-images.tar \
+            "$IMAGE_TAG_BRAIN" "$IMAGE_TAG_GATEWAY"
+          sha256sum payload/ombre-brain-images.tar \
+            | tee evidence/docker-archive-raw.sha256
+
+          gzip --no-name --best payload/ombre-brain-images.tar
+          sha256sum payload/ombre-brain-images.tar.gz \
+            | tee evidence/docker-archive-gzip.sha256
+
+          payload_bytes=$(stat --format='%s' payload/ombre-brain-images.tar.gz)
+          evidence_bytes=$(du --bytes --summarize evidence | awk '{print $1}')
+          printf 'payload_bytes=%s\nmax_payload_bytes=%s\nevidence_bytes=%s\nmax_evidence_bytes=%s\n' \
+            "$payload_bytes" "$MAX_PAYLOAD_BYTES" \
+            "$evidence_bytes" "$MAX_EVIDENCE_BYTES" \
+            | tee evidence/artifact-capacity.txt
+          test "$payload_bytes" -le "$MAX_PAYLOAD_BYTES"
+          test "$evidence_bytes" -le "$MAX_EVIDENCE_BYTES"
+
+          sha256sum evidence/* payload/* \
+            | tee evidence/delivery-files.sha256
+
+      - name: Upload audit evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ombre-brain-audit-evidence-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
+
+      - name: Upload Docker archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ombre-brain-docker-archive-${{ github.run_id }}
+          path: payload/ombre-brain-images.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
