@@ -12,8 +12,8 @@ concurrency:
 
 env:
   SOURCE_REPOSITORY: Yinglianchun/Ombre-Brain
-  SOURCE_COMMIT: e0bcbdfa07832c892be5be01f4f572f25783f943
-  SOURCE_TREE: 85dfd7b5bac3fe32d69deecc4af1f3370b682822
+  SOURCE_COMMIT: efb9dd1f16d2c4b01b4d216f01b9cb281d6c0a3f
+  SOURCE_TREE: af1ccefc5598969b849d45c9de673ba0a0fcc80d
   IMAGE_TAG_BRAIN: ombre-brain-ombre-brain
   IMAGE_TAG_GATEWAY: ombre-brain-ombre-gateway
   MIN_FREE_BYTES: "10737418240"
